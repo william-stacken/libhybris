@@ -125,6 +125,8 @@ int debug_stdout = 0;
 
 static int pid;
 
+int _linker_result;
+
 /* This boolean is set if the program being loaded is setuid */
 static int program_is_setuid;
 
@@ -508,9 +510,14 @@ _do_lookup(soinfo *si, const char *name, unsigned *base)
         if(d[0] == DT_NEEDED){
             lsi = (soinfo *)d[1];
             if (!validate_soinfo(lsi)) {
+#if 0
                 DL_ERR("%5d bad DT_NEEDED pointer in %s",
                        pid, si->name);
                 return NULL;
+#else
+                // TODO Call GNU dlsym on dependency library?
+                continue;
+#endif
             }
 
             DEBUG("%5d %s: looking up %s in %s\n",
@@ -531,8 +538,29 @@ _do_lookup(soinfo *si, const char *name, unsigned *base)
         DEBUG("%5d %s: looking up %s in executable %s\n",
               pid, si->name, name, lsi->name);
         s = _elf_lookup(lsi, elf_hash, name);
+        if(s != NULL)
+            goto done;
     }
 #endif
+
+    /* If it wasn't in the needed libraries, check all other loaded libraries */
+    for (lsi = solist; lsi != 0; lsi = lsi->next) {
+        const char *lsiname = lsi->name;
+        DEBUG("%5d %s: trying %s\n", pid, si->name, lsi->name);
+        for(d = si->dynamic; *d; d += 2) {
+            if(d[0] == DT_NEEDED && validate_soinfo((soinfo *)d[1]) && strcmp(((soinfo *)d[1])->name, lsiname) == 0){
+                lsiname = NULL;
+                break;
+            }
+        }
+        if (lsiname != NULL) {
+            DEBUG("%5d %s: looking up %s in %s\n",
+                  pid, si->name, name, lsi->name);
+            s = _elf_lookup(lsi, elf_hash, name);
+            if ((s != NULL) && (s->st_shndx != SHN_UNDEF))
+                goto done;
+        }
+    }
 
 done:
     if(s != NULL) {
@@ -551,7 +579,19 @@ done:
  */
 Elf_Sym *lookup_in_library(soinfo *si, const char *name)
 {
-    return _elf_lookup(si, elfhash(name), name);
+    void* sym;
+    _linker_result = RESULT_LINK_ERROR;
+    if (!validate_soinfo(si)) {
+        // Assume that si is actually a handler received from the GNU linker's dlopen
+        sym = dlsym(si, name);
+        if (sym != NULL)
+            _linker_result = RESULT_GNU_LINKED;
+    } else {
+        sym = _elf_lookup(si, elfhash(name), name);
+        if (sym != NULL)
+            _linker_result = RESULT_BIONIC_LINKED;
+    }
+    return (Elf_Sym*)sym;
 }
 
 /* This is used by dl_sym().  It performs a global symbol lookup.
@@ -636,8 +676,8 @@ static void dump(soinfo *si)
 #endif
 
 static const char *sopaths[] = {
-    "/vendor/lib",
     "/system/lib",
+    "/vendor/lib",
     0
 };
 
@@ -1161,7 +1201,18 @@ load_library(const char *name)
     Elf_Ehdr *hdr;
 
     if(fd == -1) {
+        TRACE("Library '%s' not found, contacting GNU linker\n", name);
+        void* handle = dlopen(name, RTLD_LAZY);
+        if (handle != NULL) {
+            _linker_result = RESULT_GNU_LINKED;
+            return (soinfo*)handle;
+        }
         DL_ERR("Library '%s' not found", name);
+        char *dle = dlerror();
+        if (dle != NULL) {
+            strlcpy(__linker_dl_err_buf, dle, sizeof(__linker_dl_err_buf));
+        }
+        _linker_result = RESULT_LINK_ERROR;
         return NULL;
     }
 
@@ -1221,11 +1272,13 @@ load_library(const char *name)
     /**/
 
     close(fd);
+    _linker_result = RESULT_BIONIC_LINKED;
     return si;
 
 fail:
     if (si) free_info(si);
     close(fd);
+    _linker_result = RESULT_LINK_ERROR;
     return NULL;
 }
 
@@ -1283,18 +1336,21 @@ soinfo *find_library(const char *name)
         if(!strcmp(bname, si->name)) {
             if(si->flags & FLAG_ERROR) {
                 DL_ERR("%5d '%s' failed to load previously", pid, bname);
+                _linker_result = RESULT_LINK_ERROR;
                 return NULL;
             }
             if(si->flags & FLAG_LINKED) return si;
             DL_ERR("OOPS: %5d recursive link to '%s'", pid, si->name);
+            _linker_result = RESULT_LINK_ERROR;
             return NULL;
         }
     }
 
     TRACE("[ %5d '%s' has not been loaded yet.  Locating...]\n", pid, name);
     si = load_library(name);
-    if(si == NULL)
-        return NULL;
+    if(si == NULL || _linker_result != RESULT_BIONIC_LINKED)
+        return si;
+
     return init_library(si);
 }
 
@@ -1328,19 +1384,24 @@ unsigned unload_library(soinfo *si)
             if(d[0] == DT_NEEDED){
                 soinfo *lsi = (soinfo *)d[1];
 
-                // The next line will segfault if the we don't undo the
-                // PT_GNU_RELRO protections (see comments above and in
-                // link_image().
-                d[1] = 0;
-
                 if (validate_soinfo(lsi)) {
+                    // The next line will segfault if the we don't undo the
+                    // PT_GNU_RELRO protections (see comments above and in
+                    // link_image().
+                    d[1] = 0;
                     TRACE("%5d %s needs to unload %s\n", pid,
                           si->name, lsi->name);
                     unload_library(lsi);
                 }
-                else
+                else {
+#if 0
                     DL_ERR("%5d %s: could not unload dependent library",
                            pid, si->name);
+#else
+                    // TODO Have GNU linker unload it?
+                    continue;
+#endif
+                }
             }
         }
 
@@ -1685,8 +1746,13 @@ void call_constructors_recursive(soinfo *si)
             if(d[0] == DT_NEEDED){
                 soinfo* lsi = (soinfo *)d[1];
                 if (!validate_soinfo(lsi)) {
+# if 0
                     DL_ERR("%5d bad DT_NEEDED pointer in %s",
                            pid, si->name);
+#else
+                    // TODO Skip as this should have been already done by GNU linker?
+                    continue;
+#endif
                 } else {
                     call_constructors_recursive(lsi);
                 }
@@ -2002,14 +2068,15 @@ static int link_image(soinfo *si, unsigned wr_offset)
         memset(preloads, 0, sizeof(preloads));
         for(i = 0; ldpreload_names[i] != NULL; i++) {
             soinfo *lsi = find_library(ldpreload_names[i]);
-            if(lsi == 0) {
+            if(lsi == 0 || _linker_result == RESULT_LINK_ERROR) {
                 strlcpy(tmp_err_buf, linker_get_error(), sizeof(tmp_err_buf));
                 DL_ERR("%5d could not load needed library '%s' for '%s' (%s)",
                        pid, ldpreload_names[i], si->name, tmp_err_buf);
                 goto fail;
+            } else if (_linker_result == RESULT_BIONIC_LINKED) {
+                lsi->refcount++;
+                preloads[i] = lsi;
             }
-            lsi->refcount++;
-            preloads[i] = lsi;
         }
     }
 
@@ -2017,21 +2084,22 @@ static int link_image(soinfo *si, unsigned wr_offset)
         if(d[0] == DT_NEEDED){
             DEBUG("%5d %s needs %s\n", pid, si->name, si->strtab + d[1]);
             soinfo *lsi = find_library(si->strtab + d[1]);
-            if(lsi == 0) {
+            if(lsi == 0 || _linker_result == RESULT_LINK_ERROR) {
                 strlcpy(tmp_err_buf, linker_get_error(), sizeof(tmp_err_buf));
                 DL_ERR("%5d could not load needed library '%s' for '%s' (%s)",
                        pid, si->strtab + d[1], si->name, tmp_err_buf);
                 goto fail;
+            } else if (_linker_result == RESULT_BIONIC_LINKED) {
+                /* Save the soinfo of the loaded DT_NEEDED library in the payload
+                   of the DT_NEEDED entry itself, so that we can retrieve the
+                   soinfo directly later from the dynamic segment.  This is a hack,
+                   but it allows us to map from DT_NEEDED to soinfo efficiently
+                   later on when we resolve relocations, trying to look up a symbol
+                   with dlsym().
+                */
+                d[1] = (unsigned)lsi;
+                lsi->refcount++;
             }
-            /* Save the soinfo of the loaded DT_NEEDED library in the payload
-               of the DT_NEEDED entry itself, so that we can retrieve the
-               soinfo directly later from the dynamic segment.  This is a hack,
-               but it allows us to map from DT_NEEDED to soinfo efficiently
-               later on when we resolve relocations, trying to look up a symbol
-               with dlsym().
-            */
-            d[1] = (unsigned)lsi;
-            lsi->refcount++;
         }
     }
 

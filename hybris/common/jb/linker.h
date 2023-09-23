@@ -220,6 +220,12 @@ extern soinfo libdl_info;
 #define DT_PREINIT_ARRAYSZ 33
 #endif
 
+#define RESULT_BIONIC_LINKED  (0)
+#define RESULT_GNU_LINKED     (1)
+#define RESULT_LINK_ERROR     (2)
+
+extern int _linker_result;
+
 soinfo *find_library(const char *name);
 unsigned unload_library(soinfo *si);
 Elf_Sym *lookup_in_library(soinfo *si, const char *name);

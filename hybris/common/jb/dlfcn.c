@@ -21,6 +21,7 @@
 #include <stdio.h>
 #include <string.h>
 #include "linker.h"
+#include "linker_debug.h"
 #include "linker_format.h"
 
 #ifdef WANT_ARM_TRACING
@@ -65,11 +66,12 @@ void *android_dlopen(const char *filename, int flag)
 {
     soinfo *ret;
 
+    PRINT("DLOPEN %s, flags %d\n", filename, flag);
     pthread_mutex_lock(&dl_lock);
     ret = find_library(filename);
-    if (unlikely(ret == NULL)) {
+    if (_linker_result == RESULT_LINK_ERROR || unlikely(ret == NULL)) {
         set_dlerror(DL_ERR_CANNOT_LOAD_LIBRARY);
-    } else {
+    } else if (_linker_result == RESULT_BIONIC_LINKED) {
         call_constructors_recursive(ret);
         ret->refcount++;
     }
@@ -79,6 +81,11 @@ void *android_dlopen(const char *filename, int flag)
 
 const char *android_dlerror(void)
 {
+    if (dl_err_str != NULL) {
+        PRINT("DLERROR %s\n", dl_err_str);
+    } else {
+        PRINT("DLERROR <no-err>\n");
+    }
     const char *tmp = dl_err_str;
     dl_err_str = NULL;
     return (const char *)tmp;
@@ -89,6 +96,8 @@ void *android_dlsym(void *handle, const char *symbol)
     soinfo *found;
     Elf_Sym *sym;
     unsigned bind;
+
+    PRINT("DLSYM %s, handle %p\n", symbol, handle);
 
     pthread_mutex_lock(&dl_lock);
 
@@ -114,6 +123,10 @@ void *android_dlsym(void *handle, const char *symbol)
     } else {
         found = (soinfo*)handle;
         sym = lookup_in_library(found, symbol);
+        if (_linker_result == RESULT_GNU_LINKED) {
+            pthread_mutex_unlock(&dl_lock);
+            return (void*)sym;
+        }
     }
 
     if(likely(sym != 0)) {
@@ -148,6 +161,8 @@ int android_dladdr(const void *addr, Dl_info *info)
 {
     int ret = 0;
 
+    PRINT("DLADDR %p\n", addr);
+
     pthread_mutex_lock(&dl_lock);
 
     /* Determine if this address can be found in any library currently mapped */
@@ -177,9 +192,12 @@ int android_dladdr(const void *addr, Dl_info *info)
 
 int android_dlclose(void *handle)
 {
+    PRINT("DLCLOSE %p (skipping)\n", handle);
+#if 0
     pthread_mutex_lock(&dl_lock);
     (void)unload_library((soinfo*)handle);
     pthread_mutex_unlock(&dl_lock);
+#endif
     return 0;
 }
 
@@ -189,7 +207,7 @@ int android_dl_iterate_phdr(int (*cb)(struct dl_phdr_info *info, size_t size, vo
 //                     0000000 00011111 111112 22222222 2333333 333344444444445555555
 //                     0123456 78901234 567890 12345678 9012345 678901234567890123456
 #define ANDROID_LIBDL_STRTAB \
-                      "dlopen\0dlclose\0dlsym\0dlerror\0dladdr\0dl_iterate_phdr\0dl_unwind_find_exidx\0"
+    "dlopen\0dlclose\0dlsym\0dlerror\0dladdr\0dl_iterate_phdr\0android_dlopen\0android_dlclose\0android_dlsym\0android_dlerror\0android_dladdr\0android_dl_iterate_phdr\0dl_unwind_find_exidx\0android_dl_unwind_find_exidx\0"
 
 _Unwind_Ptr android_dl_unwind_find_exidx(_Unwind_Ptr pc, int *pcount);
 
@@ -197,12 +215,12 @@ _Unwind_Ptr android_dl_unwind_find_exidx(_Unwind_Ptr pc, int *pcount);
 //                     0000000 00011111 111112 22222222 2333333 3333444444444455
 //                     0123456 78901234 567890 12345678 9012345 6789012345678901
 #define ANDROID_LIBDL_STRTAB \
-                      "dlopen\0dlclose\0dlsym\0dlerror\0dladdr\0dl_iterate_phdr\0"
+    "dlopen\0dlclose\0dlsym\0dlerror\0dladdr\0dl_iterate_phdr\0android_dlopen\0android_dlclose\0android_dlsym\0android_dlerror\0android_dladdr\0android_dl_iterate_phdr\0"
 #elif defined(ANDROID_SH_LINKER)
 //                     0000000 00011111 111112 22222222 2333333 3333444444444455
 //                     0123456 78901234 567890 12345678 9012345 6789012345678901
 #define ANDROID_LIBDL_STRTAB \
-                      "dlopen\0dlclose\0dlsym\0dlerror\0dladdr\0dl_iterate_phdr\0"
+    "dlopen\0dlclose\0dlsym\0dlerror\0dladdr\0dl_iterate_phdr\0android_dlopen\0android_dlclose\0android_dlsym\0android_dlerror\0android_dladdr\0android_dl_iterate_phdr\0"
 
 #else /* !defined(ANDROID_ARM_LINKER) && !defined(ANDROID_X86_LINKER) */
 #error Unsupported architecture. Only ARM and x86 are presently supported.
@@ -246,8 +264,43 @@ static Elf_Sym libdl_symtab[] = {
       st_info: STB_GLOBAL << 4,
       st_shndx: 1,
     },
-#ifdef ANDROID_ARM_LINKER
     { st_name: 52,
+      st_value: (Elf_Addr) &android_dlopen,
+      st_info: STB_GLOBAL << 4,
+      st_shndx: 1,
+    },
+    { st_name: 67,
+      st_value: (Elf_Addr) &android_dlclose,
+      st_info: STB_GLOBAL << 4,
+      st_shndx: 1,
+    },
+    { st_name: 83,
+      st_value: (Elf_Addr) &android_dlsym,
+      st_info: STB_GLOBAL << 4,
+      st_shndx: 1,
+    },
+    { st_name: 97,
+      st_value: (Elf_Addr) &android_dlerror,
+      st_info: STB_GLOBAL << 4,
+      st_shndx: 1,
+    },
+    { st_name: 113,
+      st_value: (Elf_Addr) &android_dladdr,
+      st_info: STB_GLOBAL << 4,
+      st_shndx: 1,
+    },
+    { st_name: 128,
+      st_value: (Elf_Addr) &android_dl_iterate_phdr,
+      st_info: STB_GLOBAL << 4,
+      st_shndx: 1,
+    },
+#ifdef ANDROID_ARM_LINKER
+    { st_name: 152,
+      st_value: (Elf_Addr) &android_dl_unwind_find_exidx,
+      st_info: STB_GLOBAL << 4,
+      st_shndx: 1,
+    },
+    { st_name: 173,
       st_value: (Elf_Addr) &android_dl_unwind_find_exidx,
       st_info: STB_GLOBAL << 4,
       st_shndx: 1,
@@ -276,13 +329,13 @@ static Elf_Sym libdl_symtab[] = {
  */
 static unsigned libdl_buckets[1] = { 1 };
 #if defined(ANDROID_ARM_LINKER)
-static unsigned libdl_chains[8] = { 0, 2, 3, 4, 5, 6, 7, 0 };
+static unsigned libdl_chains[14] = { 0, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 0 };
 #else
-static unsigned libdl_chains[7] = { 0, 2, 3, 4, 5, 6, 0 };
+static unsigned libdl_chains[12] = { 0, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 0 };
 #endif
 
 soinfo libdl_info = {
-    name: "libdl.so",
+    name: "libhybris-common.so.1",
     flags: FLAG_LINKED,
 
     strtab: ANDROID_LIBDL_STRTAB,
